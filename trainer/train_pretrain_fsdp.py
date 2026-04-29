@@ -7,6 +7,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import argparse
 import time
 import warnings
+from functools import partial
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
@@ -45,8 +46,12 @@ def _build_model_and_tokenizer(lm_config: MiniMindConfig):
     if args.from_weight != 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
         weight_path = f'{args.save_dir}/{args.from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-        weights = torch.load(weight_path, map_location='cpu')
-        model.load_state_dict(weights, strict=False)
+        if is_main_process():
+            weights = torch.load(weight_path, map_location='cpu')
+            model.load_state_dict(weights, strict=False)
+            del weights
+        if dist.is_initialized():
+            dist.barrier()
 
     if is_main_process():
         get_model_params(model, lm_config)
@@ -96,23 +101,14 @@ def _save_fsdp_checkpoint(epoch: int, step: int, lm_config: MiniMindConfig, mode
     dist.barrier()
 
 
-def _try_resume_fsdp(lm_config: MiniMindConfig, model: FSDP, optimizer, scaler):
+def _try_resume_fsdp(lm_config: MiniMindConfig, optimizer, scaler):
     moe_suffix = '_moe' if lm_config.use_moe else ''
     rank = dist.get_rank() if dist.is_initialized() else 0
 
-    weight_path = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
     resume_path = f'{args.checkpoint_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}_fsdp_rank{rank}.pth'
 
-    if not (os.path.exists(weight_path) and os.path.exists(resume_path)):
+    if not os.path.exists(resume_path):
         return None
-
-    with FSDP.state_dict_type(
-        model,
-        StateDictType.FULL_STATE_DICT,
-        FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
-    ):
-        weights = torch.load(weight_path, map_location='cpu')
-        model.load_state_dict(weights, strict=False)
 
     resume_data = torch.load(resume_path, map_location='cpu')
     optimizer.load_state_dict(resume_data["optimizer"])
@@ -125,18 +121,17 @@ def _try_resume_fsdp(lm_config: MiniMindConfig, model: FSDP, optimizer, scaler):
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
-    last_step = start_step
 
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device, non_blocking=True)
         labels = labels.to(args.device, non_blocking=True)
-        last_step = step
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        need_sync = (step % args.accumulation_steps == 0)
+        # 尾步也强制同步，避免最后一个累积窗口在 no_sync 下直接 step 导致多卡参数漂移
+        need_sync = (step % args.accumulation_steps == 0) or (step == iters)
         sync_ctx = nullcontext() if need_sync else model.no_sync()
 
         with sync_ctx:
@@ -189,17 +184,6 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         del input_ids, labels, res, loss
 
-    if last_step > start_step and last_step % args.accumulation_steps != 0:
-        if scaler is not None:
-            scaler.unscale_(optimizer)
-        model.clip_grad_norm_(args.grad_clip)
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining (FSDP)")
@@ -247,6 +231,17 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name)
 
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+
+    if args.from_resume == 1:
+        moe_suffix = '_moe' if lm_config.use_moe else ''
+        resume_weight_path = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+        if os.path.exists(resume_weight_path):
+            args.from_weight = args.save_weight
+            if is_main_process():
+                Logger(f"发现FSDP续训权重，自动使用 {resume_weight_path}")
+        elif is_main_process():
+            Logger("未找到续训权重文件，将从头初始化模型参数")
+
     base_model, tokenizer = _build_model_and_tokenizer(lm_config)
 
     if args.use_compile == 1:
@@ -255,7 +250,7 @@ if __name__ == "__main__":
 
     sharding_strategy = _parse_sharding_strategy(args.sharding)
     mp = MixedPrecision(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype) if device_type == "cuda" else None
-    auto_wrap_policy = transformer_auto_wrap_policy(transformer_layer_cls={MiniMindBlock})
+    auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={MiniMindBlock})
 
     model = FSDP(
         base_model,
@@ -276,7 +271,7 @@ if __name__ == "__main__":
 
     start_epoch, start_step = 0, 0
     if args.from_resume == 1:
-        resume_data = _try_resume_fsdp(lm_config, model, optimizer, scaler)
+        resume_data = _try_resume_fsdp(lm_config, optimizer, scaler)
         if resume_data:
             start_epoch = resume_data.get("epoch", 0)
             start_step = resume_data.get("step", 0)
